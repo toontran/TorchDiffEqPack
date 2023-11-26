@@ -12,11 +12,14 @@ import argparse
 import logging
 import numpy as np
 from tensorboardX import SummaryWriter
+from functools import partial
 import math
-import sys
 import os
 import shutil
-from TorchDiffEqPack.odesolver_mem import odesolve_adjoint_sym12  as odesolve
+import sys
+
+sys.path.append(r'../')
+from TorchDiffEqPack.odesolver_mem import odesolve_adjoint_sym12, odesolve_adjoint 
 
 # from torch_ode_cifar import odesolve
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
@@ -29,8 +32,19 @@ def lr_schedule(lr, epoch):
 
     return lr / math.pow(10, (optim_factor))
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--network', type=str, choices=['resnet', 'sqnxt'], default='resnet')
+parser.add_argument('--use_ode', type=str2bool, default=True, help='Use Neural ODE blocks or not')
 parser.add_argument('--method', type=str, choices=['Euler', 'RK2', 'RK4', 'RK23', 'Sym12Async', 'RK12','Dopri5'], default='Sym12Async')
 parser.add_argument('--num_epochs', type=int, default=90)
 parser.add_argument('--start_epoch', type=int, default=0)
@@ -69,11 +83,14 @@ batch_size = int(args.batch_size)
 
 is_use_cuda = torch.cuda.is_available()
 device = torch.device("cuda:0" if is_use_cuda else "cpu")
+print("="*30)
+print(args)
+print("="*30)
 
 
 class ODEBlock(nn.Module):
 
-    def __init__(self, odefunc):
+    def __init__(self, odefunc, odesolve_func):
         super(ODEBlock, self).__init__()
         self.odefunc = odefunc
         self.options = {}
@@ -85,11 +102,31 @@ class ODEBlock(nn.Module):
         self.options.update({'atol': args.atol})
         self.options.update({'print_neval': args.print_neval})
         self.options.update({'neval_max': args.neval_max})
+        self.odesolve_func=odesolve_func
         print(self.options)
 
     def forward(self, x):
-        out = odesolve(self.odefunc, x, self.options)
+        out = self.odesolve_func(self.odefunc, x, self.options)
         return out
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+        
+class IdentityBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(IdentityBlock, self).__init__()
+        self.odefunc = odefunc
+        self.options = {}
+        print("Using identity (no ode)")
+
+    def forward(self, x):
+        return x
 
     @property
     def nfe(self):
@@ -128,10 +165,19 @@ test_dataset = torchvision.datasets.CIFAR10(root='./data', transform=transform_t
 train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, num_workers=4, shuffle=True)
 test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=128, num_workers=4, shuffle=False)
 
+block = None
+if args.use_ode:
+    if args.method == "Sym12Async":
+        block = partial(ODEBlock, odesolve_func=odesolve_adjoint_sym12)
+    else:
+        block = partial(ODEBlock, odesolve_func=odesolve_adjoint)
+else:
+    block = IdentityBlock
 if args.network == 'sqnxt':
-    net = SqNxt_23_1x(10, ODEBlock)
+    net = SqNxt_23_1x(10, block)
 elif args.network == 'resnet':
-    net = ResNet18(ODEBlock)
+    net = ResNet18(block)
+print("Number of trainable params:", sum(p.numel() for p in net.parameters() if p.requires_grad))
 
 net.apply(conv_init)
 print(net)
